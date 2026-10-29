@@ -14,18 +14,22 @@ reports the best, median and worst.
 $ ./c2cbench -c 0,1,4,5,17,20
 c2cbench cas: median line, one-way handoff ns (64 lines per pair)
          0    1    4    5   17   20
-    0        67   57   61   71   63
-    1   67        99   70   69   68
-    4   57   99        81   64   63
-    5   61   70   81        81   64
-   17   71   69   64   81        62
-   20   63   68   63   64   62
+    0        59   58   57   57   55
+    1   59        57   56   57   55
+    4   58   57        55   55   54
+    5   57   56   55        55   54
+   17   57   57   55   55        55
+   20   55   55   54   54   55     
 
-per pair, over 64 lines: worst - best = 27.6 ns (median over pairs), up to 55.3 ns;
-best line vs median line: 12% faster (median over pairs), up to 33%
+per pair, over 64 lines: worst - best = 14.5 ns (median over pairs), up to 19.5 ns;
+best line vs median line: 9% faster (median over pairs), up to 19%
 ```
 
 (Xeon Gold 6314U, default clocks, with other load on the machine.)
+
+The median-line matrix is nearly flat: by the usual measure every pair looks
+the same. Yet within each pair, the line you get changes the handoff by
+~15 ns, because that line's home slice decides the route.
 
 ## Build and run
 
@@ -37,7 +41,9 @@ make            # or: g++ -O2 -std=c++17 -pthread c2cbench.cpp -o c2cbench
 ./c2cbench -m rw                 # one writer per line (SP/SC queue indices)
 ```
 
-Linux on x86-64 or AArch64, C++17, one file, no dependencies.
+Linux on x86-64 or AArch64, C++17, one file, no dependencies. Lines live in
+explicit 2 MiB hugepages when some are reserved (`sysctl vm.nr_hugepages=16`),
+else in transparent hugepages (`--pages hugetlb|thp` to choose).
 
 ## Modes
 
@@ -49,8 +55,9 @@ Linux on x86-64 or AArch64, C++17, one file, no dependencies.
 
 Reported values are one-way handoffs in ns (half a round trip). Candidate lines
 sit one per 128-byte block in hugepage memory, so the adjacent-line prefetcher
-never pairs two of them. Both cores spin for 20 ms before each pair so idle
-cores are not timed before they ramp up.
+never pairs two of them. Every selected CPU runs one pinned worker that spins
+for the whole run, so idle cores are never timed before they ramp up (this uses
+those CPUs at 100% while c2cbench runs).
 
 ## Reading the results
 

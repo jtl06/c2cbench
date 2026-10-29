@@ -25,6 +25,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
+#include <map>
+#include <memory>
 #include <numeric>
 #include <pthread.h>
 #include <random>
@@ -101,17 +104,31 @@ std::vector<int> parse_cpus(const std::string &spec) {
 }
 
 // Candidate lines: one per 128 B block (so the adjacent-line prefetcher never
-// pairs two of them), spread over a hugepage-backed region.
-std::vector<std::atomic<uint64_t> *> make_lines(size_t n, uint64_t seed) {
+// pairs two of them), in 32 MiB of 2 MiB pages. "hugetlb": explicit hugepages
+// from the reserved pool (vm.nr_hugepages): fixed physical pages, no THP
+// promotion or compaction. "thp": transparent hugepages, the fallback when the
+// pool is empty. Sets `pages` to what was used.
+std::vector<std::atomic<uint64_t> *> make_lines(size_t n, uint64_t seed, std::string &pages) {
     const size_t bytes = size_t(32) << 20, huge = size_t(2) << 20;
-    void *raw = mmap(nullptr, bytes + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (raw == MAP_FAILED)
-        throw std::runtime_error("mmap failed");
-    auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(raw) + huge - 1) & ~uintptr_t(huge - 1));
-    madvise(base, bytes, MADV_HUGEPAGE);
+    uint8_t *base = nullptr;
+    if (pages != "thp") {
+        void *raw = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        if (raw != MAP_FAILED)
+            base = static_cast<uint8_t *>(raw), pages = "hugetlb";
+        else if (pages == "hugetlb")
+            throw std::runtime_error("no explicit hugepages (reserve some: sysctl vm.nr_hugepages=16)");
+    }
+    if (!base) {
+        void *raw = mmap(nullptr, bytes + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED)
+            throw std::runtime_error("mmap failed");
+        base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(raw) + huge - 1) & ~uintptr_t(huge - 1));
+        madvise(base, bytes, MADV_HUGEPAGE);
+        pages = "thp";
+    }
     for (size_t i = 0; i < bytes; i += 4096)
         base[i] = 0;
-    mlock(base, bytes); // best effort; keeps the lines at the same physical address
+    mlock(base, bytes); // best effort; keeps THP lines at the same physical address
     std::mt19937_64 rng(seed);
     std::set<size_t> blocks;
     while (blocks.size() < n)
@@ -125,13 +142,67 @@ std::vector<std::atomic<uint64_t> *> make_lines(size_t n, uint64_t seed) {
 struct Options {
     std::string mode = "cas";
     size_t lines = 64;
-    unsigned rounds = 200, passes = 3, settle_ms = 20;
+    unsigned rounds = 200, passes = 3, settle_ms = 200; // warm-up once, at the start
     uint64_t seed = 1;
 };
 
-// Median one-way handoff (ns) for every candidate between CPUs a and b. A
-// partner thread on b serves one job (a line, or a pair of lines) at a time.
-std::vector<double> measure_pair(int a, int b, const std::vector<std::atomic<uint64_t> *> &lines, const Options &o) {
+// One pinned worker per CPU, started once and spinning while idle, so every
+// core stays at its working clock for the whole run (no per-pair warm-up).
+class Pool {
+  public:
+    explicit Pool(const std::vector<int> &cpus) {
+        for (int c : cpus)
+            slots_[c] = std::make_unique<Slot>();
+        for (auto &[c, s] : slots_)
+            s->thread = std::thread(run, c, s.get());
+    }
+    ~Pool() {
+        for (auto &[c, s] : slots_) {
+            s->quit.store(true, std::memory_order_release);
+            s->seq.fetch_add(1, std::memory_order_release);
+        }
+        for (auto &[c, s] : slots_)
+            s->thread.join();
+    }
+    // Run f on cpu's worker; returns at once.
+    void post(int cpu, std::function<void()> f) {
+        Slot &s = *slots_.at(cpu);
+        s.task = std::move(f);
+        s.seq.fetch_add(1, std::memory_order_release);
+    }
+    void wait(int cpu) {
+        Slot &s = *slots_.at(cpu);
+        while (s.done.load(std::memory_order_acquire) != s.seq.load(std::memory_order_relaxed))
+            relax();
+    }
+
+  private:
+    struct alignas(128) Slot {
+        std::atomic<uint64_t> seq{0}, done{0};
+        std::atomic<bool> quit{false};
+        std::function<void()> task;
+        std::thread thread;
+    };
+    static void run(int cpu, Slot *s) {
+        pin(cpu);
+        uint64_t seen = 0;
+        for (;;) {
+            while (s->seq.load(std::memory_order_acquire) == seen)
+                relax();
+            seen = s->seq.load(std::memory_order_acquire);
+            if (s->quit.load(std::memory_order_acquire))
+                return;
+            s->task();
+            s->done.store(seen, std::memory_order_release);
+        }
+    }
+    std::map<int, std::unique_ptr<Slot>> slots_;
+};
+
+// Median one-way handoff (ns) for every candidate between CPUs a and b: a's
+// worker drives, b's worker answers, one job (a line, or a pair of lines) at a time.
+std::vector<double> measure_pair(Pool &pool, int a, int b, const std::vector<std::atomic<uint64_t> *> &lines,
+                                 const Options &o) {
     const bool rw = o.mode == "rw";
     const size_t jobs = rw ? lines.size() / 2 : lines.size();
     struct alignas(128) Ctl {
@@ -145,9 +216,9 @@ std::vector<double> measure_pair(int a, int b, const std::vector<std::atomic<uin
     auto x_of = [&](size_t j) { return rw ? lines[2 * j] : lines[j]; };
     auto y_of = [&](size_t j) { return rw ? lines[2 * j + 1] : lines[j]; };
     const unsigned total = o.rounds + 16; // 16 untimed warm-up round trips
+    std::vector<std::vector<double>> ns(jobs);
 
-    std::thread partner([&] {
-        pin(b);
+    pool.post(b, [&] {
         uint64_t seen = 0;
         for (;;) {
             while (go.seq.load(std::memory_order_acquire) == seen)
@@ -171,48 +242,45 @@ std::vector<double> measure_pair(int a, int b, const std::vector<std::atomic<uin
             }
         }
     });
-    pin(a);
-    // Spin both cores first so idle cores are not timed before they ramp up.
-    for (auto end = Clock::now() + std::chrono::milliseconds(o.settle_ms); Clock::now() < end;)
-        relax();
-
-    std::vector<std::vector<double>> ns(jobs);
-    std::vector<size_t> order(jobs);
-    std::iota(order.begin(), order.end(), 0);
-    std::mt19937_64 rng(o.seed + unsigned(a) * 1000 + unsigned(b));
-    uint64_t seq = 0;
-    for (unsigned pass = 0; pass < o.passes; ++pass) {
-        std::shuffle(order.begin(), order.end(), rng);
-        for (size_t j : order) {
-            auto *x = x_of(j), *y = y_of(j);
-            x->store(0, std::memory_order_relaxed);
-            y->store(0, std::memory_order_relaxed);
-            go.job.store(j, std::memory_order_relaxed);
-            go.seq.store(++seq, std::memory_order_release);
-            while (ack.seq.load(std::memory_order_acquire) != seq)
-                relax();
-            Clock::time_point t0;
-            for (uint64_t r = 0; r < total; ++r) {
-                if (r == 16)
-                    t0 = Clock::now();
-                if (rw) {
-                    x->store(r + 1, std::memory_order_release);
-                    while (y->load(std::memory_order_acquire) != r + 1)
-                        relax();
-                } else {
-                    uint64_t want = 2 * r;
-                    x->compare_exchange_strong(want, want + 1, std::memory_order_acq_rel);
-                    while (x->load(std::memory_order_acquire) != 2 * r + 2)
-                        relax();
+    pool.post(a, [&] {
+        std::vector<size_t> order(jobs);
+        std::iota(order.begin(), order.end(), 0);
+        std::mt19937_64 rng(o.seed + unsigned(a) * 1000 + unsigned(b));
+        uint64_t seq = 0;
+        for (unsigned pass = 0; pass < o.passes; ++pass) {
+            std::shuffle(order.begin(), order.end(), rng);
+            for (size_t j : order) {
+                auto *x = x_of(j), *y = y_of(j);
+                x->store(0, std::memory_order_relaxed);
+                y->store(0, std::memory_order_relaxed);
+                go.job.store(j, std::memory_order_relaxed);
+                go.seq.store(++seq, std::memory_order_release);
+                while (ack.seq.load(std::memory_order_acquire) != seq)
+                    relax();
+                Clock::time_point t0;
+                for (uint64_t r = 0; r < total; ++r) {
+                    if (r == 16)
+                        t0 = Clock::now();
+                    if (rw) {
+                        x->store(r + 1, std::memory_order_release);
+                        while (y->load(std::memory_order_acquire) != r + 1)
+                            relax();
+                    } else {
+                        uint64_t want = 2 * r;
+                        x->compare_exchange_strong(want, want + 1, std::memory_order_acq_rel);
+                        while (x->load(std::memory_order_acquire) != 2 * r + 2)
+                            relax();
+                    }
                 }
+                double rt = std::chrono::duration<double, std::nano>(Clock::now() - t0).count() / o.rounds;
+                ns[j].push_back(rt / 2);
             }
-            double rt = std::chrono::duration<double, std::nano>(Clock::now() - t0).count() / o.rounds;
-            ns[j].push_back(rt / 2);
         }
-    }
-    go.quit.store(true, std::memory_order_release);
-    go.seq.store(++seq, std::memory_order_release);
-    partner.join();
+        go.quit.store(true, std::memory_order_release);
+        go.seq.store(++seq, std::memory_order_release);
+    });
+    pool.wait(a);
+    pool.wait(b);
 
     std::vector<double> med;
     for (auto &v : ns) {
@@ -235,6 +303,8 @@ double quantile(std::vector<double> v, double q) {
                  "  -l      cache lines measured per pair (default 64)\n"
                  "  -r, -n  round trips per line per pass (200), passes (3)\n"
                  "  -t      include SMT siblings (with the default CPU list)\n"
+                 "  --pages auto|hugetlb|thp  2 MiB pages: explicit (vm.nr_hugepages) or\n"
+                 "          transparent; auto prefers explicit (default)\n"
                  "  --csv   one row per pair: a,b,mode,best,p10,median,p90,worst (ns)\n"
                  "  -p      gnuplot script: heatmaps of the median and the best line\n"
                  "Default output: matrix of the median line's one-way handoff (ns), then\n"
@@ -246,7 +316,7 @@ double quantile(std::vector<double> v, double q) {
 
 int main(int argc, char **argv) try {
     Options o;
-    std::string cpus_spec, out = "matrix";
+    std::string cpus_spec, out = "matrix", pages = "auto";
     bool smt = false;
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
@@ -262,17 +332,26 @@ int main(int argc, char **argv) try {
         else if (k == "-n") o.passes = unsigned(std::stoul(val()));
         else if (k == "-s") o.seed = std::stoull(val());
         else if (k == "-t") smt = true;
+        else if (k == "--pages") pages = val();
         else if (k == "--csv") out = "csv";
         else if (k == "-p") out = "plot";
         else usage();
     }
-    if ((o.mode != "cas" && o.mode != "rw") || o.lines < 2 || o.rounds == 0 || o.passes == 0)
+    if ((o.mode != "cas" && o.mode != "rw") || o.lines < 2 || o.rounds == 0 || o.passes == 0 ||
+        (pages != "auto" && pages != "hugetlb" && pages != "thp"))
         usage();
 
     std::vector<int> cpus = cpus_spec.empty() ? usable_cpus(!smt) : parse_cpus(cpus_spec);
     if (cpus.size() < 2)
         throw std::runtime_error("need at least two CPUs");
-    auto lines = make_lines(o.lines, o.seed);
+    const bool fallback_possible = pages == "auto";
+    auto lines = make_lines(o.lines, o.seed, pages);
+    if (fallback_possible && pages == "thp")
+        std::fprintf(stderr, "c2cbench: no explicit hugepages; using transparent hugepages "
+                             "(reserve some for stabler pages: sysctl vm.nr_hugepages=16)\n");
+    Pool pool(cpus);
+    // Let every worker spin before the first pair so idle cores reach their clock.
+    std::this_thread::sleep_for(std::chrono::milliseconds(o.settle_ms));
 
     struct Row {
         int a, b;
@@ -283,8 +362,7 @@ int main(int argc, char **argv) try {
         std::printf("a,b,mode,best_ns,p10_ns,median_ns,p90_ns,worst_ns\n");
     for (size_t i = 0; i < cpus.size(); ++i)
         for (size_t j = i + 1; j < cpus.size(); ++j) {
-            std::vector<double> v;
-            std::thread([&] { v = measure_pair(cpus[i], cpus[j], lines, o); }).join();
+            std::vector<double> v = measure_pair(pool, cpus[i], cpus[j], lines, o);
             Row r{cpus[i], cpus[j], quantile(v, 0), quantile(v, 0.1), quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1)};
             rows.push_back(r);
             if (out == "csv") {
@@ -336,6 +414,7 @@ int main(int argc, char **argv) try {
             spread.push_back(r.worst - r.best);
             gain.push_back((r.med - r.best) / r.med);
         }
+        std::fprintf(out == "plot" ? stderr : stdout, "\npages: %s (2 MiB)", pages.c_str());
         std::fprintf(out == "plot" ? stderr : stdout,
                      "\nper pair, over %zu lines: worst - best = %.1f ns (median over pairs), up to %.1f ns;\n"
                      "best line vs median line: %.0f%% faster (median over pairs), up to %.0f%%\n",
