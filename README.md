@@ -159,6 +159,29 @@ Every selected CPU runs one pinned worker
 that spins for the whole run, so idle cores are never timed before they ramp up
 (this uses those CPUs at 100% while c2cbench runs).
 
+## Timing
+
+c2cbench reads `std::chrono::steady_clock` once before and once after each
+timed block (a line's 200 CAS round trips, or a whole 255-hop chain), never per
+operation. On Linux that is `clock_gettime(CLOCK_MONOTONIC)` in the vDSO, with
+no system call. On x86 the vDSO reads the TSC with `rdtscp` (checked by
+disassembling the vDSO on the Xeon 6314U, kernel 7.0, clocksource `tsc`);
+`rdtscp` waits for all earlier instructions, so the end time is taken after the
+walk's last load. On AArch64 it reads `CNTVCT_EL0` after an `isb`.
+
+- Overhead: one clock read costs about 20-35 ns. A chain takes about 15 us and
+  a line's CAS block about 20 us, so the reads add 0.1-0.2%. c2cbench does not
+  subtract them.
+- Start of a block: instructions after `rdtscp` may begin before it reads the
+  counter (no trailing `lfence`), so the first hop can start a few tens of
+  cycles early: under 0.05 ns per hop over 255 hops.
+- The fully fenced pattern is `lfence; rdtsc` to start and `rdtscp; lfence` to
+  end (see Matt Godbolt, [It's About Time](https://hudson-trading.github.io/its-about-time/),
+  C++Now 2026). At these block lengths it would not change the results, and
+  `steady_clock` keeps the code portable and in ns without TSC calibration.
+- A walk is checked to end on its chain's last line, so the compiler cannot drop
+  or shorten it.
+
 ## Reading the results
 
 - **A large spread for one pair is the home effect.** It is placement, not

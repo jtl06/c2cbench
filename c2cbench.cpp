@@ -106,7 +106,7 @@ int main(int argc, char **argv) try {
     }
     if (o.lines == 0)
         o.lines = o.mode == "cas" ? 256 : 8192;
-    if ((o.mode != "cas" && o.mode != "chase") || o.lines < 2 || o.rounds == 0 || o.passes == 0 || !(bucket > 0))
+    if ((o.mode != "cas" && o.mode != "chase") || o.lines == 0 || o.rounds == 0 || o.passes == 0 || !(bucket > 0))
         usage();
     if (o.mode == "chase" && o.lines < kChain)
         throw std::runtime_error("chase needs at least " + std::to_string(kChain) + " lines per pair");
