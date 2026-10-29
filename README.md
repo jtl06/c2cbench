@@ -10,40 +10,67 @@ hash of the line's address. So "the latency between two cores" depends on which
 line you happened to get. c2cbench times many lines per pair (64 by default) and
 reports the best, median and worst.
 
+![100 fresh core-to-core-latency runs vs c2cbench's lines](docs/runs-vs-lines.png)
+
+Run a one-line tool again and it gets a new line, so a new home: for neighbouring
+cores 0 and 1, 100 fresh core-to-core-latency runs land anywhere from 40 to 59 ns,
+in clusters. That run-to-run spread is the line-to-line spread c2cbench measures
+in a single run. For cores at opposite corners of the mesh the spread is small:
+most homes sit near the path between them, so every line takes about as long.
+
 ```
-$ ./c2cbench -c 0,1,4,5,17,20
+$ ./c2cbench -c 0,1,4,5,17,20 -s 1
 c2cbench cas: median line, one-way ns (64 lines per pair)
          0    1    4    5   17   20
-    0        59   58   57   57   55
-    1   59        57   56   57   55
-    4   58   57        55   55   54
-    5   57   56   55        55   54
-   17   57   57   55   55        55
-   20   55   55   54   54   55     
+    0        53   53   53   51   50
+    1   53        53   52   50   50
+    4   53   53        53   50   50
+    5   53   52   53        50   50
+   17   51   50   50   50        49
+   20   50   50   50   50   49     
 
-per pair, over 64 lines: worst - best = 14.5 ns (median over pairs), up to 19.5 ns;
-best line vs median line: 9% faster (median over pairs), up to 19%
+seed 1 (reproduce with -s 1)
+per pair, over 64 lines: worst - best = 12.9 ns (median over pairs), up to 19.3 ns;
+best line vs median line: 10% faster (median over pairs), up to 24%
+
+$ ./c2cbench -m chase -c 0,1,4,5,17,20 -s 1
+c2cbench chase: median line, one-way ns (64 lines per pair)
+         0    1    4    5   17   20
+    0        63   63   62   58   57
+    1   63        62   61   57   56
+    4   63   62        61   57   56
+    5   62   61   61        57   56
+   17   58   57   57   57        56
+   20   57   56   56   56   56     
+
+seed 1 (reproduce with -s 1)
+per pair, over 64 lines: worst - best = 14.7 ns (median over pairs), up to 34.8 ns;
+best line vs median line: 8% faster (median over pairs), up to 32%
 ```
 
-(Xeon Gold 6314U, default clocks, with other load on the machine.)
+All 32 cores, median line and per-pair spread (worst line − best line):
 
-The median-line matrix is nearly flat: by the usual measure every pair looks
-the same. Yet within each pair, the line you get changes the handoff by
-~15 ns, because that line's home slice decides the route.
+![CAS heatmaps](docs/heatmap-cas.png)
+![chase heatmaps](docs/heatmap-chase.png)
+
+Numbers here are from a Xeon Gold 6314U at load clocks: turbo on, `performance`
+governor, mesh at its maximum (cores ran at 2.9 GHz all-core, mesh at 2.2 GHz).
 
 ## Build and run
 
 ```sh
 make            # or: g++ -O2 -std=c++17 -pthread c2cbench.cpp -o c2cbench
 ./c2cbench                       # every pair of physical cores
-./c2cbench -c 0-7 --csv          # one row per pair: best,p10,median,p90,worst
+./c2cbench -c 0-7 --csv          # one row per pair: best,p10,median,p90,worst,seed
 ./c2cbench -p | gnuplot -p       # heatmaps of the median and the best line
 ./c2cbench -m chase              # pointer chase: one-way read of a line the other core wrote
+./c2cbench -m chase --offset 96K # the same, with the writer's copy in its L2
 ```
 
 Linux on x86-64 or AArch64, C++17, one file, no dependencies. Lines live in
-explicit 2 MiB hugepages when some are reserved (`sysctl vm.nr_hugepages=16`),
-else in transparent hugepages (`--pages hugetlb|thp` to choose).
+explicit 2 MiB hugepages, so reserve 16 first: `sudo sysctl vm.nr_hugepages=16`.
+Fixed physical pages keep every line's home for the whole run and keep TLB
+misses out of the numbers.
 
 ## Modes
 
@@ -58,9 +85,13 @@ else in transparent hugepages (`--pages hugetlb|thp` to choose).
   different lengths over different lines are timed whole, and a least-squares
   fit splits them into a fixed overhead plus a cost per line, so even coarse
   timers give per-line results.
-  The writer's copy is still in its L1 when the reader asks for it, as in a
-  producer handing data straight to a consumer; a line already evicted to the
-  writer's L2 hands off about 4 ns faster (Xeon 6314U).
+  By default the writer's copy is still in its L1 when the reader asks for it
+  (L1 → L1), as in a producer handing data straight to a consumer. With
+  `--offset SIZE` the writer stores SIZE bytes of its own after each chain,
+  pushing the chain into its L2 (L2 → L1): on the Xeon 6314U (L1d 48 KB, L2
+  1.25 MB) any offset from 64K to 768K reads ~2.5-3 ns faster than L1 → L1.
+  Keep it below the L2 size: past it the chain falls to the shared cache and
+  the reads become ~24 ns cache hits, not core-to-core transfers (c2cbench warns).
 
 Values are one-way ns per line. Candidate lines sit one per 128-byte block in
 hugepage memory, so the adjacent-line prefetcher never pairs two of them, and
@@ -70,8 +101,18 @@ that spins for the whole run, so idle cores are never timed before they ramp up
 
 ## Reading the results
 
-- **A large worst − best spread for one pair is the home effect.** It is placement, not noise; the same lines keep their homes for the life of the process.
-- **Pin clocks for stable numbers,** including the uncore if you can. On some parts a quiet two-core ping-pong lets the mesh clock drop.
-- **To use the fast lines,** see heatseeker: it finds them the same way and hands them to your data structures.
+- **A large worst − best spread for one pair is the home effect.** It is
+  placement, not noise; the same lines keep their homes for the life of the process.
+- **Each run picks new lines** (a random seed, printed with the results and in
+  the CSV's last column); `-s SEED` measures the same line set again.
+- **Measure at load clocks.** With power management left alone, a light
+  two-core ping-pong can let the mesh drop to its lowest clock and roughly
+  double every number. Set the `performance` governor and, where the driver
+  allows it, hold the uncore at its maximum
+  (`/sys/devices/system/cpu/intel_uncore_frequency/*/min_freq_khz`).
+- **Store/load ping-pongs are not one transfer.** c2clat's default test and
+  core-to-core-latency's `-b 2` move each line twice per one-way step (the
+  writer must take its line back from the reader), so they read about twice
+  the chase.
 
 License: Apache-2.0.

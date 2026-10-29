@@ -93,6 +93,21 @@ std::vector<int> usable_cpus(bool physical_only) {
     return out;
 }
 
+// Size in bytes of cpu's data/unified cache at `level` (sysfs), or 0 if unknown.
+size_t cache_size(int cpu, int level) {
+    for (int i = 0; i < 8; ++i) {
+        std::string d = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cache/index" + std::to_string(i) + "/";
+        if (slurp(d + "level") == std::to_string(level) && slurp(d + "type") != "Instruction") {
+            std::string v = slurp(d + "size");
+            if (v.empty())
+                return 0;
+            size_t n = std::stoull(v);
+            return v.back() == 'K' ? n << 10 : v.back() == 'M' ? n << 20 : n;
+        }
+    }
+    return 0;
+}
+
 // "0-3,8,10-11" -> {0,1,2,3,8,10,11}
 std::vector<int> parse_cpus(const std::string &spec) {
     std::vector<int> out;
@@ -108,31 +123,17 @@ std::vector<int> parse_cpus(const std::string &spec) {
 }
 
 // Candidate lines: one per 128 B block (so the adjacent-line prefetcher never
-// pairs two of them), in 32 MiB of 2 MiB pages. "hugetlb": explicit hugepages
-// from the reserved pool (vm.nr_hugepages): fixed physical pages, no THP
-// promotion or compaction. "thp": transparent hugepages, the fallback when the
-// pool is empty. Sets `pages` to what was used.
-std::vector<std::atomic<uint64_t> *> make_lines(size_t n, uint64_t seed, std::string &pages) {
-    const size_t bytes = size_t(32) << 20, huge = size_t(2) << 20;
-    uint8_t *base = nullptr;
-    if (pages != "thp") {
-        void *raw = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-        if (raw != MAP_FAILED)
-            base = static_cast<uint8_t *>(raw), pages = "hugetlb";
-        else if (pages == "hugetlb")
-            throw std::runtime_error("no explicit hugepages (reserve some: sysctl vm.nr_hugepages=16)");
-    }
-    if (!base) {
-        void *raw = mmap(nullptr, bytes + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (raw == MAP_FAILED)
-            throw std::runtime_error("mmap failed");
-        base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(raw) + huge - 1) & ~uintptr_t(huge - 1));
-        madvise(base, bytes, MADV_HUGEPAGE);
-        pages = "thp";
-    }
+// pairs two of them), in 32 MiB of explicit 2 MiB hugepages from the reserved
+// pool (vm.nr_hugepages): fixed physical pages, so a line keeps its home for the
+// whole run, and no TLB misses.
+std::vector<std::atomic<uint64_t> *> make_lines(size_t n, uint64_t seed) {
+    const size_t bytes = size_t(32) << 20;
+    void *raw = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (raw == MAP_FAILED)
+        throw std::runtime_error("needs 16 free 2 MiB hugepages (reserve them: sudo sysctl vm.nr_hugepages=16)");
+    auto *base = static_cast<uint8_t *>(raw);
     for (size_t i = 0; i < bytes; i += 4096)
         base[i] = 0;
-    mlock(base, bytes); // best effort; keeps THP lines at the same physical address
     std::mt19937_64 rng(seed);
     std::set<size_t> blocks;
     while (blocks.size() < n)
@@ -147,7 +148,8 @@ struct Options {
     std::string mode = "cas";
     size_t lines = 64;
     unsigned rounds = 200, passes = 3, settle_ms = 200; // warm-up once, at the start
-    uint64_t seed = 1;
+    uint64_t seed = 0; // 0: pick a new random seed each run (printed)
+    size_t offset = 0; // chase: bytes the writer stores after each chain (pushes it out of L1)
 };
 
 // One pinned worker per CPU, started once and spinning while idle, so every
@@ -365,6 +367,7 @@ std::vector<double> measure_chase(Pool &pool, int a, int b, const std::vector<st
     pool.post(a, [&] {
         std::vector<size_t> order(windows.size());
         std::iota(order.begin(), order.end(), 0);
+        std::vector<uint64_t> spill(o.offset / 8 + 8); // a's own buffer, one store per 64 B line
         uint64_t seq = 0;
         for (unsigned pass = 0; pass < o.passes + 1; ++pass) { // pass 0 is an untimed warm-up
             std::shuffle(order.begin(), order.end(), rng);
@@ -373,6 +376,9 @@ std::vector<double> measure_chase(Pool &pool, int a, int b, const std::vector<st
                 for (size_t i = 0; i < win.size(); ++i) // the last line points to a sentinel value
                     lines[win[i]]->store(i + 1 < win.size() ? reinterpret_cast<uint64_t>(lines[win[i + 1]]) : 1,
                                          std::memory_order_relaxed);
+                volatile uint64_t *v = spill.data(); // --offset: push the chain into a's L2
+                for (size_t i = 0; i + 8 <= spill.size() && o.offset; i += 8)
+                    v[i] = seq;
                 go.head.store(reinterpret_cast<uint64_t>(lines[win[0]]), std::memory_order_relaxed);
                 go.hops.store(win.size() - 1, std::memory_order_relaxed); // ends on the last line's address
                 go.seq.store(++seq, std::memory_order_release);
@@ -416,10 +422,14 @@ double quantile(std::vector<double> v, double q) {
                  "  -l      cache lines measured per pair (default 64)\n"
                  "  -r, -n  cas: round trips per line per pass (200), passes (3)\n"
                  "          chase: chain windows (200, at least 4 per line), times each is timed (3)\n"
+                 "  --offset SIZE  chase: the writer stores SIZE bytes of its own after each chain,\n"
+                 "          pushing the chain from its L1 to its L2 (L2 -> L1 instead of L1 -> L1);\n"
+                 "          pick a size between the L1d and L2 sizes, e.g. 2x L1d (default 0)\n"
+                 "  -s      seed that picks the lines (default: new each run, printed);\n"
+                 "          the same seed reproduces a run's line set\n"
                  "  -t      include SMT siblings (with the default CPU list)\n"
-                 "  --pages auto|hugetlb|thp  2 MiB pages: explicit (vm.nr_hugepages) or\n"
-                 "          transparent; auto prefers explicit (default)\n"
-                 "  --csv   one row per pair: a,b,mode,best,p10,median,p90,worst (ns)\n"
+
+                 "  --csv   one row per pair: a,b,mode,best,p10,median,p90,worst (ns),seed\n"
                  "  -p      gnuplot script: heatmaps of the median and the best line\n"
                  "Default output: matrix of the median line's one-way handoff (ns), then\n"
                  "a summary of how much the line (its home slice) changes each pair.\n");
@@ -430,7 +440,7 @@ double quantile(std::vector<double> v, double q) {
 
 int main(int argc, char **argv) try {
     Options o;
-    std::string cpus_spec, out = "matrix", pages = "auto";
+    std::string cpus_spec, out = "matrix";
     bool smt = false;
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
@@ -445,24 +455,37 @@ int main(int argc, char **argv) try {
         else if (k == "-r") o.rounds = unsigned(std::stoul(val()));
         else if (k == "-n") o.passes = unsigned(std::stoul(val()));
         else if (k == "-s") o.seed = std::stoull(val());
+        else if (k == "--offset") {
+            std::string v = val();
+            size_t mult = 1;
+            if (!v.empty() && (v.back() == 'K' || v.back() == 'k')) mult = 1024, v.pop_back();
+            else if (!v.empty() && (v.back() == 'M' || v.back() == 'm')) mult = 1024 * 1024, v.pop_back();
+            o.offset = std::stoull(v) * mult;
+        }
         else if (k == "-t") smt = true;
-        else if (k == "--pages") pages = val();
         else if (k == "--csv") out = "csv";
         else if (k == "-p") out = "plot";
         else usage();
     }
-    if ((o.mode != "cas" && o.mode != "chase") || o.lines < 2 || o.rounds == 0 || o.passes == 0 ||
-        (pages != "auto" && pages != "hugetlb" && pages != "thp"))
+    if ((o.mode != "cas" && o.mode != "chase") || o.lines < 2 || o.rounds == 0 || o.passes == 0)
         usage();
+    if (o.seed == 0) {
+        std::random_device rd;
+        o.seed = 1 + (uint64_t(rd()) << 32 | rd()) % 1000000000;
+    }
 
     std::vector<int> cpus = cpus_spec.empty() ? usable_cpus(!smt) : parse_cpus(cpus_spec);
     if (cpus.size() < 2)
         throw std::runtime_error("need at least two CPUs");
-    const bool fallback_possible = pages == "auto";
-    auto lines = make_lines(o.lines, o.seed, pages);
-    if (fallback_possible && pages == "thp")
-        std::fprintf(stderr, "c2cbench: no explicit hugepages; using transparent hugepages "
-                             "(reserve some for stabler pages: sysctl vm.nr_hugepages=16)\n");
+    if (o.mode == "chase" && o.offset) {
+        size_t l1 = cache_size(cpus[0], 1), l2 = cache_size(cpus[0], 2);
+        if (l1 && o.offset < l1)
+            std::fprintf(stderr, "c2cbench: --offset %zu < L1d (%zu): the chain stays in the writer's L1\n", o.offset, l1);
+        if (l2 && o.offset >= l2)
+            std::fprintf(stderr, "c2cbench: --offset %zu >= L2 (%zu): the chain leaves the writer's L2, so reads "
+                                 "become shared-cache hits, not core-to-core transfers\n", o.offset, l2);
+    }
+    auto lines = make_lines(o.lines, o.seed);
     Pool pool(cpus);
     // Let every worker spin before the first pair so idle cores reach their clock.
     std::this_thread::sleep_for(std::chrono::milliseconds(o.settle_ms));
@@ -473,7 +496,7 @@ int main(int argc, char **argv) try {
     };
     std::vector<Row> rows;
     if (out == "csv")
-        std::printf("a,b,mode,best_ns,p10_ns,median_ns,p90_ns,worst_ns\n");
+        std::printf("a,b,mode,best_ns,p10_ns,median_ns,p90_ns,worst_ns,seed\n");
     for (size_t i = 0; i < cpus.size(); ++i)
         for (size_t j = i + 1; j < cpus.size(); ++j) {
             std::vector<double> v = o.mode == "cas" ? measure_cas(pool, cpus[i], cpus[j], lines, o)
@@ -481,8 +504,8 @@ int main(int argc, char **argv) try {
             Row r{cpus[i], cpus[j], quantile(v, 0), quantile(v, 0.1), quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1)};
             rows.push_back(r);
             if (out == "csv") {
-                std::printf("%d,%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f\n", r.a, r.b, o.mode.c_str(), r.best, r.p10, r.med, r.p90,
-                            r.worst);
+                std::printf("%d,%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n", r.a, r.b, o.mode.c_str(), r.best, r.p10, r.med, r.p90,
+                            r.worst, (unsigned long long)o.seed);
                 std::fflush(stdout);
             }
         }
@@ -529,7 +552,10 @@ int main(int argc, char **argv) try {
             spread.push_back(r.worst - r.best);
             gain.push_back((r.med - r.best) / r.med);
         }
-        std::fprintf(out == "plot" ? stderr : stdout, "\npages: %s (2 MiB)", pages.c_str());
+        std::fprintf(out == "plot" ? stderr : stdout, "\nseed %llu (reproduce with -s %llu)",
+                     (unsigned long long)o.seed, (unsigned long long)o.seed);
+        if (o.mode == "chase")
+            std::fprintf(out == "plot" ? stderr : stdout, "; writer offset %zu B", o.offset);
         std::fprintf(out == "plot" ? stderr : stdout,
                      "\nper pair, over %zu lines: worst - best = %.1f ns (median over pairs), up to %.1f ns;\n"
                      "best line vs median line: %.0f%% faster (median over pairs), up to %.0f%%\n",
