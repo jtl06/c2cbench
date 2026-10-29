@@ -7,20 +7,24 @@
 // c2cbench times many lines per pair and reports the best, median and worst.
 //
 //   c2cbench                 all pairs of physical cores, median matrix
-//   c2cbench -m rw -c 0-7 --csv   handshake mode, CPUs 0-7, one CSV row per pair
+//   c2cbench -m chase -c 0-7 --csv   pointer chase, CPUs 0-7, one CSV row per pair
 //   c2cbench -p | gnuplot -p      heatmap of the median
 //
-// Modes:
-//   cas  both cores CAS one line in turn (lock handoff)
-//   rw   core a writes line x and b reads it, then b writes line y and a reads
-//        it (one writer per line, like an SP/SC queue's indices)
-// Reported per pair: one-way handoff in ns (half a round trip), over the lines.
+// Modes (ns per line, one way):
+//   cas    both cores CAS one line in turn (a lock handoff), each retrying until
+//          its turn, as c2clat -w and core-to-core-latency do: half a round trip
+//   chase  the lower CPU writes a pointer chain through some of the lines, the
+//          other follows it: one dependent read of a line the other core just
+//          wrote, per hop. Chains of different lengths over different lines are
+//          timed whole, and a least-squares fit splits them into a fixed overhead
+//          plus a cost per line, so coarse timers still give per-line results.
 //
 // Linux, x86-64 or AArch64, C++17. Build: g++ -O2 -std=c++17 -pthread c2cbench.cpp -o c2cbench
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -199,24 +203,25 @@ class Pool {
     std::map<int, std::unique_ptr<Slot>> slots_;
 };
 
-// Median one-way handoff (ns) for every candidate between CPUs a and b: a's
-// worker drives, b's worker answers, one job (a line, or a pair of lines) at a time.
-std::vector<double> measure_pair(Pool &pool, int a, int b, const std::vector<std::atomic<uint64_t> *> &lines,
-                                 const Options &o) {
-    const bool rw = o.mode == "rw";
-    const size_t jobs = rw ? lines.size() / 2 : lines.size();
+double median(std::vector<double> v) {
+    std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
+    return v[v.size() / 2];
+}
+
+// cas: median one-way handoff (ns) for every line between CPUs a and b. a's
+// worker drives, b's worker answers, one line at a time.
+std::vector<double> measure_cas(Pool &pool, int a, int b, const std::vector<std::atomic<uint64_t> *> &lines,
+                                const Options &o) {
     struct alignas(128) Ctl {
         std::atomic<uint64_t> seq{0};
-        std::atomic<size_t> job{0};
+        std::atomic<size_t> line{0};
         std::atomic<bool> quit{false};
     } go;
     struct alignas(128) Ack {
         std::atomic<uint64_t> seq{0};
     } ack;
-    auto x_of = [&](size_t j) { return rw ? lines[2 * j] : lines[j]; };
-    auto y_of = [&](size_t j) { return rw ? lines[2 * j + 1] : lines[j]; };
     const unsigned total = o.rounds + 16; // 16 untimed warm-up round trips
-    std::vector<std::vector<double>> ns(jobs);
+    std::vector<std::vector<double>> ns(lines.size());
 
     pool.post(b, [&] {
         uint64_t seen = 0;
@@ -226,34 +231,24 @@ std::vector<double> measure_pair(Pool &pool, int a, int b, const std::vector<std
             seen = go.seq.load(std::memory_order_acquire);
             if (go.quit.load(std::memory_order_acquire))
                 return;
-            auto *x = x_of(go.job.load(std::memory_order_relaxed)), *y = y_of(go.job.load(std::memory_order_relaxed));
+            auto *x = lines[go.line.load(std::memory_order_relaxed)];
             ack.seq.store(seen, std::memory_order_release);
-            for (uint64_t r = 0; r < total; ++r) {
-                if (rw) { // wait for a's write to x, answer on y
-                    while (x->load(std::memory_order_acquire) != r + 1)
-                        relax();
-                    y->store(r + 1, std::memory_order_release);
-                } else {  // wait for a's CAS, answer with our own
-                    uint64_t want = 2 * r + 1;
-                    while (x->load(std::memory_order_acquire) != want)
-                        relax();
-                    x->compare_exchange_strong(want, want + 1, std::memory_order_acq_rel);
-                }
-            }
+            for (uint64_t r = 0; r < total; ++r) // retry until a's CAS lands, then ours does
+                for (uint64_t want = 2 * r + 1; !x->compare_exchange_strong(want, want + 1, std::memory_order_acq_rel);)
+                    want = 2 * r + 1;
         }
     });
     pool.post(a, [&] {
-        std::vector<size_t> order(jobs);
+        std::vector<size_t> order(lines.size());
         std::iota(order.begin(), order.end(), 0);
         std::mt19937_64 rng(o.seed + unsigned(a) * 1000 + unsigned(b));
         uint64_t seq = 0;
         for (unsigned pass = 0; pass < o.passes; ++pass) {
             std::shuffle(order.begin(), order.end(), rng);
             for (size_t j : order) {
-                auto *x = x_of(j), *y = y_of(j);
+                auto *x = lines[j];
                 x->store(0, std::memory_order_relaxed);
-                y->store(0, std::memory_order_relaxed);
-                go.job.store(j, std::memory_order_relaxed);
+                go.line.store(j, std::memory_order_relaxed);
                 go.seq.store(++seq, std::memory_order_release);
                 while (ack.seq.load(std::memory_order_acquire) != seq)
                     relax();
@@ -261,17 +256,11 @@ std::vector<double> measure_pair(Pool &pool, int a, int b, const std::vector<std
                 for (uint64_t r = 0; r < total; ++r) {
                     if (r == 16)
                         t0 = Clock::now();
-                    if (rw) {
-                        x->store(r + 1, std::memory_order_release);
-                        while (y->load(std::memory_order_acquire) != r + 1)
-                            relax();
-                    } else {
-                        uint64_t want = 2 * r;
-                        x->compare_exchange_strong(want, want + 1, std::memory_order_acq_rel);
-                        while (x->load(std::memory_order_acquire) != 2 * r + 2)
-                            relax();
-                    }
+                    for (uint64_t want = 2 * r; !x->compare_exchange_strong(want, want + 1, std::memory_order_acq_rel);)
+                        want = 2 * r; // retry, as c2clat -w and core-to-core-latency do
                 }
+                while (x->load(std::memory_order_acquire) != 2 * total) // b's last CAS
+                    relax();
                 double rt = std::chrono::duration<double, std::nano>(Clock::now() - t0).count() / o.rounds;
                 ns[j].push_back(rt / 2);
             }
@@ -283,11 +272,134 @@ std::vector<double> measure_pair(Pool &pool, int a, int b, const std::vector<std
     pool.wait(b);
 
     std::vector<double> med;
-    for (auto &v : ns) {
-        std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
-        med.push_back(v[v.size() / 2]);
-    }
+    for (auto &v : ns)
+        med.push_back(median(v));
     return med;
+}
+
+// Least squares: rows of 0/1 indicators (plus a constant column) against times.
+// Solves the normal equations with Gaussian elimination.
+std::vector<double> fit(const std::vector<std::vector<size_t>> &rows, const std::vector<double> &t, size_t n) {
+    const size_t m = n + 1; // unknowns: overhead, then one cost per line
+    std::vector<double> A(m * m, 0), y(m, 0);
+    for (size_t r = 0; r < rows.size(); ++r) {
+        std::vector<size_t> cols{0};
+        for (size_t i : rows[r])
+            cols.push_back(i + 1);
+        for (size_t i : cols) {
+            y[i] += t[r];
+            for (size_t j : cols)
+                A[i * m + j] += 1;
+        }
+    }
+    for (size_t c = 0; c < m; ++c) {
+        size_t p = c;
+        for (size_t r = c + 1; r < m; ++r)
+            if (std::abs(A[r * m + c]) > std::abs(A[p * m + c]))
+                p = r;
+        if (std::abs(A[p * m + c]) < 1e-9)
+            throw std::runtime_error("chase fit is singular (too few windows)");
+        for (size_t j = 0; j < m; ++j)
+            std::swap(A[c * m + j], A[p * m + j]);
+        std::swap(y[c], y[p]);
+        for (size_t r = 0; r < m; ++r)
+            if (r != c) {
+                double f = A[r * m + c] / A[c * m + c];
+                for (size_t j = c; j < m; ++j)
+                    A[r * m + j] -= f * A[c * m + j];
+                y[r] -= f * y[c];
+            }
+    }
+    std::vector<double> x(n);
+    for (size_t i = 0; i < n; ++i)
+        x[i] = y[i + 1] / A[(i + 1) * m + i + 1];
+    return x;
+}
+
+// chase: a (the writer) stores a pointer chain through a window of the lines,
+// so each sits modified in a's cache; b follows it, timing the dependent loads.
+// Window sizes run from 1/8 to 1/2 of the lines; each window is timed o.passes
+// times (median), and the fit splits window times into overhead + cost per line.
+std::vector<double> measure_chase(Pool &pool, int a, int b, const std::vector<std::atomic<uint64_t> *> &lines,
+                                  const Options &o) {
+    const size_t n = lines.size();
+    std::mt19937_64 rng(o.seed + unsigned(a) * 1000 + unsigned(b));
+    std::vector<std::vector<size_t>> windows(std::max<size_t>(o.rounds, 4 * n)); // enough rows to fit n costs
+    for (size_t w = 0; w < windows.size(); ++w) {
+        size_t k = std::max<size_t>(2, n * (1 + w % 4) / 8);
+        std::vector<size_t> all(n);
+        std::iota(all.begin(), all.end(), 0);
+        std::shuffle(all.begin(), all.end(), rng);
+        windows[w].assign(all.begin(), all.begin() + long(k)); // also the chain order
+    }
+    struct alignas(128) Ctl {
+        std::atomic<uint64_t> seq{0};
+        std::atomic<uint64_t> head{0}, hops{0};
+        std::atomic<bool> quit{false};
+    } go;
+    struct alignas(128) Ack {
+        std::atomic<uint64_t> seq{0}, end{0};
+        std::atomic<double> ns{0};
+    } ack;
+    std::vector<std::vector<double>> ns(windows.size());
+    bool wrong = false;
+
+    pool.post(b, [&] {
+        uint64_t seen = 0;
+        for (;;) {
+            while (go.seq.load(std::memory_order_acquire) == seen)
+                relax();
+            seen = go.seq.load(std::memory_order_acquire);
+            if (go.quit.load(std::memory_order_acquire))
+                return;
+            uint64_t p = go.head.load(std::memory_order_relaxed), hops = go.hops.load(std::memory_order_relaxed);
+            auto t0 = Clock::now();
+            for (uint64_t i = 0; i < hops; ++i) // each load needs the previous one's value
+                p = reinterpret_cast<std::atomic<uint64_t> *>(p)->load(std::memory_order_relaxed);
+            auto t1 = Clock::now();
+            ack.end.store(p, std::memory_order_relaxed);
+            ack.ns.store(std::chrono::duration<double, std::nano>(t1 - t0).count(), std::memory_order_relaxed);
+            ack.seq.store(seen, std::memory_order_release);
+        }
+    });
+    pool.post(a, [&] {
+        std::vector<size_t> order(windows.size());
+        std::iota(order.begin(), order.end(), 0);
+        uint64_t seq = 0;
+        for (unsigned pass = 0; pass < o.passes + 1; ++pass) { // pass 0 is an untimed warm-up
+            std::shuffle(order.begin(), order.end(), rng);
+            for (size_t w : order) {
+                auto &win = windows[w];
+                for (size_t i = 0; i < win.size(); ++i) // the last line points to a sentinel value
+                    lines[win[i]]->store(i + 1 < win.size() ? reinterpret_cast<uint64_t>(lines[win[i + 1]]) : 1,
+                                         std::memory_order_relaxed);
+                go.head.store(reinterpret_cast<uint64_t>(lines[win[0]]), std::memory_order_relaxed);
+                go.hops.store(win.size() - 1, std::memory_order_relaxed); // ends on the last line's address
+                go.seq.store(++seq, std::memory_order_release);
+                while (ack.seq.load(std::memory_order_acquire) != seq)
+                    relax();
+                wrong |= ack.end.load(std::memory_order_relaxed) != reinterpret_cast<uint64_t>(lines[win.back()]);
+                if (pass > 0)
+                    ns[w].push_back(ack.ns.load(std::memory_order_relaxed));
+            }
+        }
+        go.quit.store(true, std::memory_order_release);
+        go.seq.store(++seq, std::memory_order_release);
+    });
+    pool.wait(a);
+    pool.wait(b);
+    if (wrong)
+        throw std::runtime_error("chase ended on the wrong line");
+
+    // A window of k lines makes k-1 hops: it loads every line but the last
+    // (which only holds the end marker).
+    std::vector<std::vector<size_t>> rows;
+    std::vector<double> t;
+    for (size_t w = 0; w < windows.size(); ++w) {
+        rows.emplace_back(windows[w].begin(), windows[w].end() - 1);
+        t.push_back(median(ns[w]));
+    }
+    return fit(rows, t, n);
 }
 
 double quantile(std::vector<double> v, double q) {
@@ -297,11 +409,13 @@ double quantile(std::vector<double> v, double q) {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
-                 "usage: c2cbench [-m cas|rw] [-c CPUS] [-l LINES] [-r ROUNDS] [-n PASSES] [-t] [--csv | -p] [-s SEED]\n"
-                 "  -m      cas: both cores CAS one line (default); rw: one writer per line\n"
+                 "usage: c2cbench [-m cas|chase] [-c CPUS] [-l LINES] [-r ROUNDS] [-n PASSES] [-t] [--csv | -p] [-s SEED]\n"
+                 "  -m      cas: both cores CAS one line in turn (default)\n"
+                 "          chase: the lower CPU writes a pointer chain, the other follows it\n"
                  "  -c      CPUs to use, e.g. 0-7,16 (default: one CPU per physical core)\n"
                  "  -l      cache lines measured per pair (default 64)\n"
-                 "  -r, -n  round trips per line per pass (200), passes (3)\n"
+                 "  -r, -n  cas: round trips per line per pass (200), passes (3)\n"
+                 "          chase: chain windows (200, at least 4 per line), times each is timed (3)\n"
                  "  -t      include SMT siblings (with the default CPU list)\n"
                  "  --pages auto|hugetlb|thp  2 MiB pages: explicit (vm.nr_hugepages) or\n"
                  "          transparent; auto prefers explicit (default)\n"
@@ -337,7 +451,7 @@ int main(int argc, char **argv) try {
         else if (k == "-p") out = "plot";
         else usage();
     }
-    if ((o.mode != "cas" && o.mode != "rw") || o.lines < 2 || o.rounds == 0 || o.passes == 0 ||
+    if ((o.mode != "cas" && o.mode != "chase") || o.lines < 2 || o.rounds == 0 || o.passes == 0 ||
         (pages != "auto" && pages != "hugetlb" && pages != "thp"))
         usage();
 
@@ -362,7 +476,8 @@ int main(int argc, char **argv) try {
         std::printf("a,b,mode,best_ns,p10_ns,median_ns,p90_ns,worst_ns\n");
     for (size_t i = 0; i < cpus.size(); ++i)
         for (size_t j = i + 1; j < cpus.size(); ++j) {
-            std::vector<double> v = measure_pair(pool, cpus[i], cpus[j], lines, o);
+            std::vector<double> v = o.mode == "cas" ? measure_cas(pool, cpus[i], cpus[j], lines, o)
+                                                    : measure_chase(pool, cpus[i], cpus[j], lines, o);
             Row r{cpus[i], cpus[j], quantile(v, 0), quantile(v, 0.1), quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1)};
             rows.push_back(r);
             if (out == "csv") {
@@ -380,7 +495,7 @@ int main(int argc, char **argv) try {
     };
     if (out == "plot") {
         for (auto [title, f] : {std::pair{"median line", &Row::med}, std::pair{"best line", &Row::best}}) {
-            std::printf("set title \"c2cbench %s: %s one-way handoff (ns)\"\nset xlabel \"CPU\"\nset ylabel \"CPU\"\n"
+            std::printf("set title \"c2cbench %s: %s one-way (ns)\"\nset xlabel \"CPU\"\nset ylabel \"CPU\"\n"
                         "set palette defined (0 '#1a9850', 1 '#fee08b', 2 '#d73027')\nplot '-' matrix rowheaders "
                         "columnheaders with image notitle\n",
                         o.mode.c_str(), title);
@@ -397,7 +512,7 @@ int main(int argc, char **argv) try {
             std::printf("e\npause mouse close\n");
         }
     } else if (out == "matrix") {
-        std::printf("c2cbench %s: median line, one-way handoff ns (%zu lines per pair)\n     ", o.mode.c_str(), lines.size());
+        std::printf("c2cbench %s: median line, one-way ns (%zu lines per pair)\n     ", o.mode.c_str(), lines.size());
         for (int c : cpus)
             std::printf("%5d", c);
         std::printf("\n");

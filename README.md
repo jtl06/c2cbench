@@ -12,7 +12,7 @@ reports the best, median and worst.
 
 ```
 $ ./c2cbench -c 0,1,4,5,17,20
-c2cbench cas: median line, one-way handoff ns (64 lines per pair)
+c2cbench cas: median line, one-way ns (64 lines per pair)
          0    1    4    5   17   20
     0        59   58   57   57   55
     1   59        57   56   57   55
@@ -38,7 +38,7 @@ make            # or: g++ -O2 -std=c++17 -pthread c2cbench.cpp -o c2cbench
 ./c2cbench                       # every pair of physical cores
 ./c2cbench -c 0-7 --csv          # one row per pair: best,p10,median,p90,worst
 ./c2cbench -p | gnuplot -p       # heatmaps of the median and the best line
-./c2cbench -m rw                 # one writer per line (SP/SC queue indices)
+./c2cbench -m chase              # pointer chase: one-way read of a line the other core wrote
 ```
 
 Linux on x86-64 or AArch64, C++17, one file, no dependencies. Lines live in
@@ -47,17 +47,26 @@ else in transparent hugepages (`--pages hugetlb|thp` to choose).
 
 ## Modes
 
-- **cas**: both cores CAS one line in turn, like a lock handoff (as in
-  core-to-core-latency's CAS test and c2clat's `-w`).
-- **rw**: core a writes line x and b reads it, then b writes line y and a reads
-  it. Each line has one writer, like an SP/SC queue's indices (as in c2clat's
-  default test).
+- **cas**: both cores CAS one line in turn, like a lock handoff. Each core
+  retries its `lock cmpxchg` until the other's has landed, exactly as c2clat's
+  `-w` and core-to-core-latency's CAS test do, so only the number of lines
+  differs. Reported as half a round trip.
+- **chase**: the lower-numbered CPU writes a pointer chain through some of the
+  lines, so each sits modified in its cache; the other CPU follows the chain.
+  Each hop is one dependent read of a line the other core just wrote: the
+  one-way transfer itself, with no round trip and no lock retries. Chains of
+  different lengths over different lines are timed whole, and a least-squares
+  fit splits them into a fixed overhead plus a cost per line, so even coarse
+  timers give per-line results.
+  The writer's copy is still in its L1 when the reader asks for it, as in a
+  producer handing data straight to a consumer; a line already evicted to the
+  writer's L2 hands off about 4 ns faster (Xeon 6314U).
 
-Reported values are one-way handoffs in ns (half a round trip). Candidate lines
-sit one per 128-byte block in hugepage memory, so the adjacent-line prefetcher
-never pairs two of them. Every selected CPU runs one pinned worker that spins
-for the whole run, so idle cores are never timed before they ramp up (this uses
-those CPUs at 100% while c2cbench runs).
+Values are one-way ns per line. Candidate lines sit one per 128-byte block in
+hugepage memory, so the adjacent-line prefetcher never pairs two of them, and
+chains visit them in random order. Every selected CPU runs one pinned worker
+that spins for the whole run, so idle cores are never timed before they ramp up
+(this uses those CPUs at 100% while c2cbench runs).
 
 ## Reading the results
 
