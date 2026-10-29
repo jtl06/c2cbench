@@ -4,20 +4,23 @@
 // core pair. On mesh and ring CPUs that line moves owner -> home slice ->
 // requester, and its home comes from an undocumented address hash, so the
 // "latency between two cores" depends on which line you happened to get.
-// c2cbench times many lines per pair and reports the best, median and worst.
+// c2cbench times many lines per pair and reports the mean over lines.
 //
-//   c2cbench                 all pairs of physical cores, median matrix
+//   c2cbench                 all pairs of physical cores, matrix of the mean over lines
 //   c2cbench -m chase -c 0-7 --csv   pointer chase, CPUs 0-7, one CSV row per pair
-//   c2cbench -p | gnuplot -p      heatmap of the median
+//   c2cbench -c 0,1 --hist   cas, histogram of the per-line times (one mode per home distance)
+//   c2cbench -p | gnuplot -p      heatmaps
 //
-// Modes (ns per line, one way):
+// Modes (ns, one way):
 //   cas    both cores CAS one line in turn (a lock handoff), each retrying until
-//          its turn, as c2clat -w and core-to-core-latency do: half a round trip
-//   chase  the lower CPU writes a pointer chain through some of the lines, the
-//          other follows it: one dependent read of a line the other core just
-//          wrote, per hop. Chains of different lengths over different lines are
-//          timed whole, and a least-squares fit splits them into a fixed overhead
-//          plus a cost per line, so coarse timers still give per-line results.
+//          its turn, as c2clat -w and core-to-core-latency do: half a round trip.
+//          Timed per line, so it shows how the line (its home) changes the time.
+//   chase  the lower CPU writes a pointer chain, the other follows it: one dependent
+//          read of a line the other core just wrote, per hop. Every chain is made of
+//          lines no core has loaded before in this run (drawn from a large pool), so
+//          no prefetcher can have learned them; some recent Arm cores learn chains
+//          they have seen and fetch ahead. The result is a mean over many fresh
+//          lines, not per-line values.
 //
 // Linux, x86-64 or AArch64, C++17. Build: g++ -O2 -std=c++17 -pthread c2cbench.cpp -o c2cbench
 // SPDX-License-Identifier: Apache-2.0
@@ -122,10 +125,11 @@ std::vector<int> parse_cpus(const std::string &spec) {
     return out;
 }
 
-// Candidate lines: one per 128 B block (so the adjacent-line prefetcher never
-// pairs two of them), in 32 MiB of explicit 2 MiB hugepages from the reserved
-// pool (vm.nr_hugepages): fixed physical pages, so a line keeps its home for the
-// whole run, and no TLB misses.
+// Candidate lines: one per 128 B block, at a random half of it (so the
+// adjacent-line prefetcher never pairs two of them, and the lines use every L1
+// set), in 32 MiB of explicit 2 MiB hugepages from the reserved pool
+// (vm.nr_hugepages): fixed physical pages, so a line keeps its home for the whole
+// run, and 16 pages, which the first-level TLB covers (no TLB misses).
 std::vector<std::atomic<uint64_t> *> make_lines(size_t n, uint64_t seed) {
     const size_t bytes = size_t(32) << 20;
     void *raw = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -140,17 +144,21 @@ std::vector<std::atomic<uint64_t> *> make_lines(size_t n, uint64_t seed) {
         blocks.insert(rng() % (bytes / 128));
     std::vector<std::atomic<uint64_t> *> out;
     for (size_t b : blocks)
-        out.push_back(new (base + b * 128) std::atomic<uint64_t>(0));
+        out.push_back(new (base + b * 128 + 64 * (rng() & 1)) std::atomic<uint64_t>(0));
+    std::shuffle(out.begin(), out.end(), rng);
     return out;
 }
 
 struct Options {
     std::string mode = "cas";
-    size_t lines = 64;
+    size_t lines = 0; // per pair; 0: 256 (cas), 8192 (chase)
     unsigned rounds = 200, passes = 3, settle_ms = 200; // warm-up once, at the start
     uint64_t seed = 0; // 0: pick a new random seed each run (printed)
     size_t offset = 0; // chase: bytes the writer stores after each chain (pushes it out of L1)
 };
+
+// chase: chains of kChain lines (16 KB: in every L1), drawn from kPool fresh lines.
+const size_t kChain = 256, kPool = 100000, kWarmChains = 4;
 
 // One pinned worker per CPU, started once and spinning while idle, so every
 // core stays at its working clock for the whole run (no per-pair warm-up).
@@ -279,61 +287,35 @@ std::vector<double> measure_cas(Pool &pool, int a, int b, const std::vector<std:
     return med;
 }
 
-// Least squares: rows of 0/1 indicators (plus a constant column) against times.
-// Solves the normal equations with Gaussian elimination.
-std::vector<double> fit(const std::vector<std::vector<size_t>> &rows, const std::vector<double> &t, size_t n) {
-    const size_t m = n + 1; // unknowns: overhead, then one cost per line
-    std::vector<double> A(m * m, 0), y(m, 0);
-    for (size_t r = 0; r < rows.size(); ++r) {
-        std::vector<size_t> cols{0};
-        for (size_t i : rows[r])
-            cols.push_back(i + 1);
-        for (size_t i : cols) {
-            y[i] += t[r];
-            for (size_t j : cols)
-                A[i * m + j] += 1;
-        }
+// Fresh lines for the chase. Each pair takes the next lines of a shuffled pool;
+// when the pool runs out it is reshuffled. A prefetcher that learned "B follows A"
+// from an earlier chain then finds B in the current chain with probability about
+// kChain / kPool (0.3%), so it cannot help.
+class Fresh {
+  public:
+    Fresh(std::vector<std::atomic<uint64_t> *> lines, uint64_t seed) : lines_(std::move(lines)), rng_(seed) {}
+    std::vector<std::atomic<uint64_t> *> take(size_t n) {
+        if (next_ + n > lines_.size())
+            std::shuffle(lines_.begin(), lines_.end(), rng_), next_ = 0;
+        next_ += n;
+        return {lines_.begin() + long(next_ - n), lines_.begin() + long(next_)};
     }
-    for (size_t c = 0; c < m; ++c) {
-        size_t p = c;
-        for (size_t r = c + 1; r < m; ++r)
-            if (std::abs(A[r * m + c]) > std::abs(A[p * m + c]))
-                p = r;
-        if (std::abs(A[p * m + c]) < 1e-9)
-            throw std::runtime_error("chase fit is singular (too few windows)");
-        for (size_t j = 0; j < m; ++j)
-            std::swap(A[c * m + j], A[p * m + j]);
-        std::swap(y[c], y[p]);
-        for (size_t r = 0; r < m; ++r)
-            if (r != c) {
-                double f = A[r * m + c] / A[c * m + c];
-                for (size_t j = c; j < m; ++j)
-                    A[r * m + j] -= f * A[c * m + j];
-                y[r] -= f * y[c];
-            }
-    }
-    std::vector<double> x(n);
-    for (size_t i = 0; i < n; ++i)
-        x[i] = y[i + 1] / A[(i + 1) * m + i + 1];
-    return x;
-}
 
-// chase: a (the writer) stores a pointer chain through a window of the lines,
-// so each sits modified in a's cache; b follows it, timing the dependent loads.
-// Window sizes run from 1/8 to 1/2 of the lines; each window is timed o.passes
-// times (median), and the fit splits window times into overhead + cost per line.
-std::vector<double> measure_chase(Pool &pool, int a, int b, const std::vector<std::atomic<uint64_t> *> &lines,
-                                  const Options &o) {
-    const size_t n = lines.size();
-    std::mt19937_64 rng(o.seed + unsigned(a) * 1000 + unsigned(b));
-    std::vector<std::vector<size_t>> windows(std::max<size_t>(o.rounds, 4 * n)); // enough rows to fit n costs
-    for (size_t w = 0; w < windows.size(); ++w) {
-        size_t k = std::max<size_t>(2, n * (1 + w % 4) / 8);
-        std::vector<size_t> all(n);
-        std::iota(all.begin(), all.end(), 0);
-        std::shuffle(all.begin(), all.end(), rng);
-        windows[w].assign(all.begin(), all.begin() + long(k)); // also the chain order
-    }
+  private:
+    std::vector<std::atomic<uint64_t> *> lines_;
+    std::mt19937_64 rng_;
+    size_t next_ = 0;
+};
+
+// chase: a (the writer) links a chain of fresh lines, so each sits modified in a's
+// cache; b follows it, timing the dependent loads (one clock read around the whole
+// walk: under 1% overhead at 255 hops). Returns ns per hop for each timed chain,
+// without chains far above the pair's median (a disturbance: an interrupt during
+// its ~15 us); *dropped counts those.
+std::vector<double> measure_chase(Pool &pool, int a, int b, Fresh &fresh, const Options &o, size_t *dropped) {
+    std::vector<std::vector<std::atomic<uint64_t> *>> chains(kWarmChains + std::max<size_t>(1, o.lines / kChain));
+    for (auto &c : chains)
+        c = fresh.take(kChain);
     struct alignas(128) Ctl {
         std::atomic<uint64_t> seq{0};
         std::atomic<uint64_t> head{0}, hops{0};
@@ -343,7 +325,7 @@ std::vector<double> measure_chase(Pool &pool, int a, int b, const std::vector<st
         std::atomic<uint64_t> seq{0}, end{0};
         std::atomic<double> ns{0};
     } ack;
-    std::vector<std::vector<double>> ns(windows.size());
+    std::vector<double> per_hop;
     bool wrong = false;
 
     pool.post(b, [&] {
@@ -365,29 +347,23 @@ std::vector<double> measure_chase(Pool &pool, int a, int b, const std::vector<st
         }
     });
     pool.post(a, [&] {
-        std::vector<size_t> order(windows.size());
-        std::iota(order.begin(), order.end(), 0);
         std::vector<uint64_t> spill(o.offset / 8 + 8); // a's own buffer, one store per 64 B line
         uint64_t seq = 0;
-        for (unsigned pass = 0; pass < o.passes + 1; ++pass) { // pass 0 is an untimed warm-up
-            std::shuffle(order.begin(), order.end(), rng);
-            for (size_t w : order) {
-                auto &win = windows[w];
-                for (size_t i = 0; i < win.size(); ++i) // the last line points to a sentinel value
-                    lines[win[i]]->store(i + 1 < win.size() ? reinterpret_cast<uint64_t>(lines[win[i + 1]]) : 1,
-                                         std::memory_order_relaxed);
-                volatile uint64_t *v = spill.data(); // --offset: push the chain into a's L2
-                for (size_t i = 0; i + 8 <= spill.size() && o.offset; i += 8)
-                    v[i] = seq;
-                go.head.store(reinterpret_cast<uint64_t>(lines[win[0]]), std::memory_order_relaxed);
-                go.hops.store(win.size() - 1, std::memory_order_relaxed); // ends on the last line's address
-                go.seq.store(++seq, std::memory_order_release);
-                while (ack.seq.load(std::memory_order_acquire) != seq)
-                    relax();
-                wrong |= ack.end.load(std::memory_order_relaxed) != reinterpret_cast<uint64_t>(lines[win.back()]);
-                if (pass > 0)
-                    ns[w].push_back(ack.ns.load(std::memory_order_relaxed));
-            }
+        for (size_t w = 0; w < chains.size(); ++w) { // the first kWarmChains are untimed
+            auto &ch = chains[w];
+            for (size_t i = 0; i < ch.size(); ++i) // the last line points to a sentinel value
+                ch[i]->store(i + 1 < ch.size() ? reinterpret_cast<uint64_t>(ch[i + 1]) : 1, std::memory_order_relaxed);
+            volatile uint64_t *v = spill.data(); // --offset: push the chain into a's L2
+            for (size_t i = 0; i + 8 <= spill.size() && o.offset; i += 8)
+                v[i] = seq;
+            go.head.store(reinterpret_cast<uint64_t>(ch[0]), std::memory_order_relaxed);
+            go.hops.store(ch.size() - 1, std::memory_order_relaxed); // ends on the last line's address
+            go.seq.store(++seq, std::memory_order_release);
+            while (ack.seq.load(std::memory_order_acquire) != seq)
+                relax();
+            wrong |= ack.end.load(std::memory_order_relaxed) != reinterpret_cast<uint64_t>(ch.back());
+            if (w >= kWarmChains)
+                per_hop.push_back(ack.ns.load(std::memory_order_relaxed) / double(ch.size() - 1));
         }
         go.quit.store(true, std::memory_order_release);
         go.seq.store(++seq, std::memory_order_release);
@@ -397,15 +373,17 @@ std::vector<double> measure_chase(Pool &pool, int a, int b, const std::vector<st
     if (wrong)
         throw std::runtime_error("chase ended on the wrong line");
 
-    // A window of k lines makes k-1 hops: it loads every line but the last
-    // (which only holds the end marker).
-    std::vector<std::vector<size_t>> rows;
-    std::vector<double> t;
-    for (size_t w = 0; w < windows.size(); ++w) {
-        rows.emplace_back(windows[w].begin(), windows[w].end() - 1);
-        t.push_back(median(ns[w]));
-    }
-    return fit(rows, t, n);
+    const double m = median(per_hop);
+    std::vector<double> dev;
+    for (double x : per_hop)
+        dev.push_back(std::abs(x - m));
+    const double cut = m + 5 * std::max(median(dev), 0.5);
+    std::vector<double> kept;
+    for (double x : per_hop)
+        if (x <= cut)
+            kept.push_back(x);
+    *dropped += per_hop.size() - kept.size();
+    return kept;
 }
 
 double quantile(std::vector<double> v, double q) {
@@ -415,25 +393,40 @@ double quantile(std::vector<double> v, double q) {
 
 [[noreturn]] void usage() {
     std::fprintf(stderr,
-                 "usage: c2cbench [-m cas|chase] [-c CPUS] [-l LINES] [-r ROUNDS] [-n PASSES] [-t] [--csv | -p] [-s SEED]\n"
-                 "  -m      cas: both cores CAS one line in turn (default)\n"
-                 "          chase: the lower CPU writes a pointer chain, the other follows it\n"
+                 "usage: c2cbench [-m cas|chase] [-c CPUS] [-l LINES] [-r ROUNDS] [-n PASSES] [-t] [--csv | -p] [--hist]\n"
+                 "                [--bucket NS] [--offset SIZE] [-s SEED]\n"
+                 "  -m      cas: both cores CAS one line in turn, timed per line (default)\n"
+                 "          chase: the lower CPU writes a pointer chain of fresh lines, the other follows it\n"
                  "  -c      CPUs to use, e.g. 0-7,16 (default: one CPU per physical core)\n"
-                 "  -l      cache lines measured per pair (default 64)\n"
+                 "  -l      lines per pair (cas: 256, each timed on its own; chase: 8192, in chains of 256)\n"
                  "  -r, -n  cas: round trips per line per pass (200), passes (3)\n"
-                 "          chase: chain windows (200, at least 4 per line), times each is timed (3)\n"
+                 "  --hist  cas: histogram of the per-line times for each pair (with --csv: one row per line)\n"
+                 "  --bucket NS  histogram bucket width (default 1)\n"
                  "  --offset SIZE  chase: the writer stores SIZE bytes of its own after each chain,\n"
                  "          pushing the chain from its L1 to its L2 (L2 -> L1 instead of L1 -> L1);\n"
                  "          pick a size between the L1d and L2 sizes, e.g. 2x L1d (default 0)\n"
                  "  -s      seed that picks the lines (default: new each run, printed);\n"
                  "          the same seed reproduces a run's line set\n"
                  "  -t      include SMT siblings (with the default CPU list)\n"
-
-                 "  --csv   one row per pair: a,b,mode,best,p10,median,p90,worst (ns),seed\n"
-                 "  -p      gnuplot script: heatmaps of the median and the best line\n"
-                 "Default output: matrix of the median line's one-way handoff (ns), then\n"
-                 "a summary of how much the line (its home slice) changes each pair.\n");
+                 "  --csv   one row per pair: a,b,mode,best,p10,median,p90,worst,mean (ns),seed\n"
+                 "          (cas: over lines; chase: over chains of 256 lines)\n"
+                 "  -p      gnuplot script: heatmaps of the mean (and, for cas, the best line)\n"
+                 "Default output: matrix of the mean one-way time (ns), then a summary.\n");
     std::exit(2);
+}
+
+// Text histogram of one pair's per-line times: on a mesh, one mode per distance
+// from the pair to the lines' home slices.
+void histogram(int a, int b, const std::vector<double> &v, double width) {
+    const double lo = std::floor(*std::min_element(v.begin(), v.end()) / width) * width;
+    std::vector<size_t> count(size_t((*std::max_element(v.begin(), v.end()) - lo) / width) + 1);
+    for (double x : v)
+        ++count[size_t((x - lo) / width)];
+    const size_t top = *std::max_element(count.begin(), count.end());
+    std::printf("\nCPUs %d-%d: %zu lines, mean %.1f ns\n", a, b, v.size(),
+                std::accumulate(v.begin(), v.end(), 0.0) / double(v.size()));
+    for (size_t i = 0; i < count.size(); ++i)
+        std::printf("%7.1f %5zu %s\n", lo + double(i) * width, count[i], std::string((count[i] * 50 + top - 1) / top, '#').c_str());
 }
 
 } // namespace
@@ -441,7 +434,8 @@ double quantile(std::vector<double> v, double q) {
 int main(int argc, char **argv) try {
     Options o;
     std::string cpus_spec, out = "matrix";
-    bool smt = false;
+    bool smt = false, hist = false;
+    double bucket = 1;
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         auto val = [&] {
@@ -462,13 +456,23 @@ int main(int argc, char **argv) try {
             else if (!v.empty() && (v.back() == 'M' || v.back() == 'm')) mult = 1024 * 1024, v.pop_back();
             o.offset = std::stoull(v) * mult;
         }
+        else if (k == "--hist") hist = true;
+        else if (k == "--bucket") bucket = std::stod(val());
         else if (k == "-t") smt = true;
         else if (k == "--csv") out = "csv";
         else if (k == "-p") out = "plot";
         else usage();
     }
-    if ((o.mode != "cas" && o.mode != "chase") || o.lines < 2 || o.rounds == 0 || o.passes == 0)
+    if (o.lines == 0)
+        o.lines = o.mode == "cas" ? 256 : 8192;
+    if ((o.mode != "cas" && o.mode != "chase") || o.lines < 2 || o.rounds == 0 || o.passes == 0 || !(bucket > 0))
         usage();
+    if (o.mode == "chase" && o.lines < kChain)
+        throw std::runtime_error("chase needs at least " + std::to_string(kChain) + " lines per pair");
+    if (hist && o.mode != "cas")
+        throw std::runtime_error("--hist needs per-line times: use it with -m cas");
+    if (o.mode == "cas" && o.offset)
+        throw std::runtime_error("--offset applies to -m chase");
     if (o.seed == 0) {
         std::random_device rd;
         o.seed = 1 + (uint64_t(rd()) << 32 | rd()) % 1000000000;
@@ -485,28 +489,41 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "c2cbench: --offset %zu >= L2 (%zu): the chain leaves the writer's L2, so reads "
                                  "become shared-cache hits, not core-to-core transfers\n", o.offset, l2);
     }
-    auto lines = make_lines(o.lines, o.seed);
+    auto lines = make_lines(o.mode == "cas" ? o.lines : kPool, o.seed);
+    Fresh fresh(lines, o.seed * 31 + 7);
+    size_t dropped = 0;
     Pool pool(cpus);
     // Let every worker spin before the first pair so idle cores reach their clock.
     std::this_thread::sleep_for(std::chrono::milliseconds(o.settle_ms));
 
     struct Row {
         int a, b;
-        double best, p10, med, p90, worst;
+        double best, p10, med, p90, worst, mean;
     };
     std::vector<Row> rows;
-    if (out == "csv")
-        std::printf("a,b,mode,best_ns,p10_ns,median_ns,p90_ns,worst_ns,seed\n");
+    const bool line_rows = out == "csv" && hist;
+    if (line_rows)
+        std::printf("a,b,mode,line,ns,seed\n");
+    else if (out == "csv")
+        std::printf("a,b,mode,best_ns,p10_ns,median_ns,p90_ns,worst_ns,mean_ns,seed\n");
+    std::vector<std::pair<std::pair<int, int>, std::vector<double>>> hists;
     for (size_t i = 0; i < cpus.size(); ++i)
         for (size_t j = i + 1; j < cpus.size(); ++j) {
             std::vector<double> v = o.mode == "cas" ? measure_cas(pool, cpus[i], cpus[j], lines, o)
-                                                    : measure_chase(pool, cpus[i], cpus[j], lines, o);
-            Row r{cpus[i], cpus[j], quantile(v, 0), quantile(v, 0.1), quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1)};
+                                                    : measure_chase(pool, cpus[i], cpus[j], fresh, o, &dropped);
+            Row r{cpus[i], cpus[j], quantile(v, 0), quantile(v, 0.1), quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1),
+                  std::accumulate(v.begin(), v.end(), 0.0) / double(v.size())};
             rows.push_back(r);
-            if (out == "csv") {
-                std::printf("%d,%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n", r.a, r.b, o.mode.c_str(), r.best, r.p10, r.med, r.p90,
-                            r.worst, (unsigned long long)o.seed);
+            if (line_rows) {
+                for (size_t l = 0; l < v.size(); ++l)
+                    std::printf("%d,%d,%s,%zu,%.2f,%llu\n", r.a, r.b, o.mode.c_str(), l, v[l], (unsigned long long)o.seed);
                 std::fflush(stdout);
+            } else if (out == "csv") {
+                std::printf("%d,%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n", r.a, r.b, o.mode.c_str(), r.best, r.p10, r.med,
+                            r.p90, r.worst, r.mean, (unsigned long long)o.seed);
+                std::fflush(stdout);
+            } else if (hist) {
+                hists.push_back({{r.a, r.b}, v});
             }
         }
 
@@ -516,8 +533,11 @@ int main(int argc, char **argv) try {
                 return r.*f;
         return 0.0;
     };
+    std::vector<std::pair<const char *, double Row::*>> maps{{"mean", &Row::mean}};
+    if (o.mode == "cas")
+        maps.push_back({"best line", &Row::best});
     if (out == "plot") {
-        for (auto [title, f] : {std::pair{"median line", &Row::med}, std::pair{"best line", &Row::best}}) {
+        for (auto [title, f] : maps) {
             std::printf("set title \"c2cbench %s: %s one-way (ns)\"\nset xlabel \"CPU\"\nset ylabel \"CPU\"\n"
                         "set palette defined (0 '#1a9850', 1 '#fee08b', 2 '#d73027')\nplot '-' matrix rowheaders "
                         "columnheaders with image notitle\n",
@@ -535,31 +555,43 @@ int main(int argc, char **argv) try {
             std::printf("e\npause mouse close\n");
         }
     } else if (out == "matrix") {
-        std::printf("c2cbench %s: median line, one-way ns (%zu lines per pair)\n     ", o.mode.c_str(), lines.size());
+        if (o.mode == "cas")
+            std::printf("c2cbench cas: mean over lines, one-way ns (%zu lines per pair)\n     ", o.lines);
+        else
+            std::printf("c2cbench chase: mean over fresh lines, one-way ns (%zu lines per pair, each used once)\n     ",
+                        (o.lines / kChain) * kChain);
         for (int c : cpus)
             std::printf("%5d", c);
         std::printf("\n");
         for (int a : cpus) {
             std::printf("%5d", a);
             for (int b : cpus)
-                a == b ? std::printf("%5s", "") : std::printf("%5.0f", cell(a, b, &Row::med));
+                a == b ? std::printf("%5s", "") : std::printf("%5.0f", cell(a, b, &Row::mean));
             std::printf("\n");
         }
     }
+    for (auto &[ab, v] : hists)
+        histogram(ab.first, ab.second, v, bucket);
     if (out != "csv") {
-        std::vector<double> spread, gain;
-        for (auto &r : rows) {
-            spread.push_back(r.worst - r.best);
-            gain.push_back((r.med - r.best) / r.med);
+        FILE *f = out == "plot" ? stderr : stdout;
+        std::fprintf(f, "\nseed %llu (reproduce with -s %llu)", (unsigned long long)o.seed, (unsigned long long)o.seed);
+        if (o.mode == "chase") {
+            std::vector<double> spread;
+            for (auto &r : rows)
+                spread.push_back(r.p90 - r.p10);
+            std::fprintf(f, "; writer offset %zu B\nchains of %zu lines from a pool of %zu: p90 - p10 over chains = %.1f ns "
+                            "(median over pairs); %zu disturbed chains dropped\n",
+                         o.offset, kChain, kPool, quantile(spread, 0.5), dropped);
+        } else {
+            std::vector<double> spread, gain;
+            for (auto &r : rows) {
+                spread.push_back(r.worst - r.best);
+                gain.push_back((r.mean - r.best) / r.mean);
+            }
+            std::fprintf(f, "\nper pair, over %zu lines: worst - best = %.1f ns (median over pairs), up to %.1f ns;\n"
+                            "best line vs mean: %.0f%% faster (median over pairs), up to %.0f%%\n",
+                         o.lines, quantile(spread, 0.5), quantile(spread, 1), 100 * quantile(gain, 0.5), 100 * quantile(gain, 1));
         }
-        std::fprintf(out == "plot" ? stderr : stdout, "\nseed %llu (reproduce with -s %llu)",
-                     (unsigned long long)o.seed, (unsigned long long)o.seed);
-        if (o.mode == "chase")
-            std::fprintf(out == "plot" ? stderr : stdout, "; writer offset %zu B", o.offset);
-        std::fprintf(out == "plot" ? stderr : stdout,
-                     "\nper pair, over %zu lines: worst - best = %.1f ns (median over pairs), up to %.1f ns;\n"
-                     "best line vs median line: %.0f%% faster (median over pairs), up to %.0f%%\n",
-                     lines.size(), quantile(spread, 0.5), quantile(spread, 1), 100 * quantile(gain, 0.5), 100 * quantile(gain, 1));
     }
     return 0;
 } catch (const std::exception &e) {
