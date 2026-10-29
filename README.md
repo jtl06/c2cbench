@@ -112,15 +112,19 @@ make            # or: g++ -O2 -std=c++17 -pthread c2cbench.cpp -o c2cbench
 ./c2cbench                       # every pair of physical cores
 ./c2cbench -c 0-7 --csv          # one row per pair: best,p10,median,p90,worst,mean,seed
 ./c2cbench -c 0,1 --hist         # per-line histogram for one pair (--csv: one row per line)
-./c2cbench -p | gnuplot -p       # heatmaps of the mean and the best line
 ./c2cbench -m chase              # pointer chase: one-way read of a line the other core wrote
 ./c2cbench -m chase --offset 96K # the same, with the writer's copy in its L2
 ```
 
-Linux on x86-64 or AArch64, C++17, one file, no dependencies. Lines live in
+Linux on x86-64 or AArch64, C++17, no dependencies. Lines live in
 explicit 2 MiB hugepages, so reserve 16 first: `sudo sysctl vm.nr_hugepages=16`.
 Fixed physical pages keep every line's home for the whole run and keep TLB
 misses out of the numbers.
+
+The source is split by job: `harness.hpp` (CPU list, pinned workers, lines,
+statistics), `cas.hpp` and `chase.hpp` (one benchmark each), and `c2cbench.cpp`
+(command line and output). The headers stand alone, so other tools can reuse
+the harness or a benchmark. `docs/heatmaps.py` draws heatmaps from `--csv`.
 
 ## Modes
 
